@@ -46,6 +46,7 @@
 #include <profiler.h>
 #include <bitset>
 #include <vector>
+#include <future>   // NOLINT
 
 #include "hwc_buffer_allocator.h"
 #include "hwc_buffer_sync_handler.h"
@@ -283,7 +284,7 @@ int HWCSession::Prepare(hwc_composer_device_1 *device, size_t num_displays,
     }
 
     if (hwc_session->need_invalidate_) {
-      hwc_procs->invalidate(hwc_procs);
+      hwc_session->AsyncRefresh();
       hwc_session->need_invalidate_ = false;
     }
 
@@ -414,6 +415,8 @@ int HWCSession::Set(hwc_composer_device_1 *device, size_t num_displays,
     hwc_session->bw_mode_release_fd_ = dup(content_list->retireFenceFd);
   }
 
+  locker_.Signal();
+
   // This is only indicative of how many times SurfaceFlinger posts
   // frames to the display.
   CALC_FPS();
@@ -465,6 +468,8 @@ bool HWCSession::IsDisplayYUV(int disp) {
 }
 
 int HWCSession::EventControl(hwc_composer_device_1 *device, int disp, int event, int enable) {
+  SCOPE_LOCK(locker_);
+
   if (!device) {
     return -EINVAL;
   }
@@ -685,6 +690,20 @@ int HWCSession::DisconnectDisplay(int disp) {
   return 0;
 }
 
+static void PostRefresh(hwc_procs_t const *hwc_procs) {
+  hwc_procs->invalidate(hwc_procs);
+}
+
+void HWCSession::AsyncRefresh() {
+  // If a refresh request is already pending, do not post another request.
+  if (future_.valid() &&
+      future_.wait_for(std::chrono::milliseconds(0)) == std::future_status::timeout) {
+    return;
+  }
+
+  future_ = std::async(PostRefresh, hwc_procs_);
+}
+
 android::status_t HWCSession::notifyCallback(uint32_t command, const android::Parcel *input_parcel,
                                              android::Parcel *output_parcel) {
   SEQUENCE_WAIT_SCOPE_LOCK(locker_);
@@ -697,7 +716,7 @@ android::status_t HWCSession::notifyCallback(uint32_t command, const android::Pa
     break;
 
   case qService::IQService::SCREEN_REFRESH:
-    hwc_procs_->invalidate(hwc_procs_);
+    AsyncRefresh();
     break;
 
   case qService::IQService::SET_IDLE_TIMEOUT:
@@ -848,7 +867,7 @@ android::status_t HWCSession::GetPanelBrightness(const android::Parcel *input_pa
 }
 
 android::status_t HWCSession::ControlPartialUpdate(const android::Parcel *input_parcel,
-                                                   android::Parcel *out) {
+                                                   android::Parcel *output_parcel) {
   DisplayError error = kErrorNone;
   int ret = 0;
   uint32_t disp_id = UINT32(input_parcel->readInt32());
@@ -857,14 +876,14 @@ android::status_t HWCSession::ControlPartialUpdate(const android::Parcel *input_
   if (disp_id != HWC_DISPLAY_PRIMARY) {
     DLOGW("CONTROL_PARTIAL_UPDATE is not applicable for display = %d", disp_id);
     ret = -EINVAL;
-    out->writeInt32(ret);
+    output_parcel->writeInt32(ret);
     return ret;
   }
 
   if (!hwc_display_[HWC_DISPLAY_PRIMARY]) {
     DLOGE("primary display object is not instantiated");
     ret = -EINVAL;
-    out->writeInt32(ret);
+    output_parcel->writeInt32(ret);
     return ret;
   }
 
@@ -873,31 +892,30 @@ android::status_t HWCSession::ControlPartialUpdate(const android::Parcel *input_
 
   if (error == kErrorNone) {
     if (!pending) {
-      out->writeInt32(ret);
+      output_parcel->writeInt32(ret);
       return ret;
     }
   } else if (error == kErrorNotSupported) {
-    out->writeInt32(ret);
+    output_parcel->writeInt32(ret);
     return ret;
   } else {
     ret = -EINVAL;
-    out->writeInt32(ret);
+    output_parcel->writeInt32(ret);
     return ret;
   }
 
-  // Todo(user): Unlock it before sending events to client. It may cause deadlocks in future.
-  hwc_procs_->invalidate(hwc_procs_);
+  AsyncRefresh();
 
   // Wait until partial update control is complete
   ret = locker_.WaitFinite(kPartialUpdateControlTimeoutMs);
 
-  out->writeInt32(ret);
+  output_parcel->writeInt32(ret);
 
   return ret;
 }
 
 android::status_t HWCSession::HandleSetActiveDisplayConfig(const android::Parcel *input_parcel,
-                                                     android::Parcel *output_parcel) {
+                                                           android::Parcel *output_parcel) {
   int config = input_parcel->readInt32();
   int dpy = input_parcel->readInt32();
   int error = android::BAD_VALUE;
@@ -909,7 +927,7 @@ android::status_t HWCSession::HandleSetActiveDisplayConfig(const android::Parcel
   if (hwc_display_[dpy]) {
     error = hwc_display_[dpy]->SetActiveDisplayConfig(config);
     if (error == 0) {
-      hwc_procs_->invalidate(hwc_procs_);
+      AsyncRefresh();
     }
   }
 
@@ -1120,7 +1138,7 @@ android::status_t HWCSession::SetDynamicBWForCamera(const android::Parcel *input
   HWBwModes mode = camera_status > 0 ? kBwCamera : kBwDefault;
 
   // trigger invalidate to apply new bw caps.
-  hwc_procs_->invalidate(hwc_procs_);
+  AsyncRefresh();
 
     error = core_intf_->SetMaxBandwidthMode(mode);
   if (error != kErrorNone) {
@@ -1317,7 +1335,7 @@ android::status_t HWCSession::QdcmCMDHandler(const android::Parcel *input_parcel
 
   switch (pending_action.action) {
     case kInvalidating:
-      hwc_procs_->invalidate(hwc_procs_);
+      AsyncRefresh();
       break;
     case kEnterQDCMMode:
       ret = color_mgr_->EnableQDCMMode(true, hwc_display_[HWC_DISPLAY_PRIMARY]);
@@ -1328,12 +1346,12 @@ android::status_t HWCSession::QdcmCMDHandler(const android::Parcel *input_parcel
     case kApplySolidFill:
       ret = color_mgr_->SetSolidFill(pending_action.params,
                                      true, hwc_display_[HWC_DISPLAY_PRIMARY]);
-      hwc_procs_->invalidate(hwc_procs_);
+      AsyncRefresh();
       break;
     case kDisableSolidFill:
       ret = color_mgr_->SetSolidFill(pending_action.params,
                                      false, hwc_display_[HWC_DISPLAY_PRIMARY]);
-      hwc_procs_->invalidate(hwc_procs_);
+      AsyncRefresh();
       break;
     case kSetPanelBrightness:
       brightness_value = reinterpret_cast<int32_t*>(resp_payload.payload);
@@ -1347,7 +1365,7 @@ android::status_t HWCSession::QdcmCMDHandler(const android::Parcel *input_parcel
     case kEnableFrameCapture:
       ret = color_mgr_->SetFrameCapture(pending_action.params,
                                         true, hwc_display_[HWC_DISPLAY_PRIMARY]);
-      hwc_procs_->invalidate(hwc_procs_);
+      AsyncRefresh();
       break;
     case kDisableFrameCapture:
       ret = color_mgr_->SetFrameCapture(pending_action.params,
@@ -1356,7 +1374,7 @@ android::status_t HWCSession::QdcmCMDHandler(const android::Parcel *input_parcel
     case kConfigureDetailedEnhancer:
       ret = color_mgr_->SetDetailedEnhancer(pending_action.params,
                                             hwc_display_[HWC_DISPLAY_PRIMARY]);
-      hwc_procs_->invalidate(hwc_procs_);
+      AsyncRefresh();
       break;
     case kInvalidatingAndkSetPanelBrightness:
       brightness_value = reinterpret_cast<int32_t*>(resp_payload.payload);
@@ -1366,7 +1384,7 @@ android::status_t HWCSession::QdcmCMDHandler(const android::Parcel *input_parcel
       }
       if (HWC_DISPLAY_PRIMARY == display_id)
         ret = hwc_display_[HWC_DISPLAY_PRIMARY]->CachePanelBrightness(*brightness_value);
-      hwc_procs_->invalidate(hwc_procs_);
+      AsyncRefresh();
       break;
     case kNoAction:
       break;
@@ -1445,7 +1463,7 @@ void* HWCSession::HWCUeventThreadHandler() {
       if (panel_reset == 0) {
         if (hwc_procs_) {
           reset_panel_ = true;
-          hwc_procs_->invalidate(hwc_procs_);
+          AsyncRefresh();
         } else {
           DLOGW("Ignore resetpanel - hwc_proc not registered");
         }
